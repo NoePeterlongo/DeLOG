@@ -36,9 +36,17 @@ The file **stem** is the parser name shown in the menu. Files are editable with 
 editor; new or changed files appear without restarting (the list is read fresh each time the
 menu opens).
 
-Custom parsers are **never auto-sniffed**. DéLOG only auto-detects the built-in Rust formats;
-a custom Python parser is always chosen explicitly, and the Parsers menu lists custom Python
-parsers only (not the built-in parsers).
+Custom parsers are **never content-sniffed**. DéLOG only auto-detects the built-in Rust
+formats; a custom Python parser is always chosen explicitly the first time, and the Parsers
+menu lists custom Python parsers only (not the built-in parsers).
+
+After you open a file with a custom parser once, DéLOG remembers the mapping
+"file extension → parser" in its settings: the plain **File ▸ Open** flow then routes files
+with that extension through that parser automatically, and the Open dialog lists the
+extension in its filter. Extensions of the built-in formats (`.ulg`, `.BIN`, `.tlog`,
+`.parquet`) are never learned - they always keep built-in detection, even after a deliberate
+custom-parser read. The last parser used for an extension wins; delete the
+`parser_files` entry in the settings file to unlearn a mapping.
 
 ---
 

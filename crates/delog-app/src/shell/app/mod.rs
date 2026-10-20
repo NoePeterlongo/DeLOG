@@ -806,6 +806,15 @@ impl DelogApp {
         let tx = self.picked_files_tx.clone();
         let ctx = ctx.clone();
         let parser = parser.map(str::to_owned);
+        // Learned custom-parser extensions join the built-in filter so the
+        // picker proposes exotic logs directly.
+        let learned_extensions: Vec<String> = self
+            .settings
+            .parser_files
+            .parser_by_extension
+            .keys()
+            .cloned()
+            .collect();
         std::thread::Builder::new()
             .name("delog-open-dialog".into())
             .spawn(move || {
@@ -813,13 +822,22 @@ impl DelogApp {
                     Some(name) => rfd::FileDialog::new()
                         .add_filter("All files", &["*"])
                         .set_title(format!("Open with {}", parser_label(name))),
-                    None => rfd::FileDialog::new()
-                        .add_filter(
-                            "Flight logs",
-                            &["bin", "BIN", "ulg", "ulog", "tlog", "parquet"],
-                        )
-                        .add_filter("All files", &["*"])
-                        .set_title("Open flight logs"),
+                    None => {
+                        let mut extensions = vec![
+                            "bin".to_owned(),
+                            "BIN".to_owned(),
+                            "ulg".to_owned(),
+                            "ulog".to_owned(),
+                            "tlog".to_owned(),
+                            "parquet".to_owned(),
+                        ];
+                        extensions.extend(learned_extensions);
+                        let extensions: Vec<&str> = extensions.iter().map(String::as_str).collect();
+                        rfd::FileDialog::new()
+                            .add_filter("Flight logs", &extensions)
+                            .add_filter("All files", &["*"])
+                            .set_title("Open flight logs")
+                    }
                 };
                 if let Some(paths) = dialog.pick_files() {
                     let _ = tx.send(PickedFiles { paths, parser });
@@ -829,10 +847,77 @@ impl DelogApp {
             .expect("spawn file dialog thread");
     }
 
+    /// Learn the extension-to-parser routing from successful custom-parser
+    /// reads: opening a `.foo` file with a parser makes the plain Open flow
+    /// use that parser for every later `.foo` pick. Built-in sniffed
+    /// extensions never learn; the last parser used for an extension wins.
+    #[cfg(feature = "scripting")]
+    fn learn_parser_file_extensions(&mut self) {
+        for (parser_name, path) in self.scripts.take_parsed_parser_files() {
+            let Some(extension) =
+                crate::config::settings::ParserFileSettings::learnable_extension(&path)
+            else {
+                continue;
+            };
+            if self
+                .settings
+                .parser_files
+                .parser_by_extension
+                .get(&extension)
+                .is_some_and(|current| current == &parser_name)
+            {
+                continue;
+            }
+            self.settings
+                .parser_files
+                .parser_by_extension
+                .insert(extension.clone(), parser_name.clone());
+            match crate::config::layout::doc::save_app_settings(&self.settings) {
+                Ok(()) => self
+                    .session
+                    .push_diagnostic(delog_core::diagnostics::Diag::info(
+                        "parser-bind",
+                        format!("files with .{extension} now open with {parser_name}"),
+                    )),
+                Err(error) => self
+                    .session
+                    .push_diagnostic(delog_core::diagnostics::Diag::error(
+                        "settings-save",
+                        error.to_string(),
+                    )),
+            }
+        }
+    }
+
     fn handle_picked_files(&mut self) {
         while let Ok(picked) = self.picked_files.try_recv() {
             for path in picked.paths {
-                self.session.open_path(path, picked.parser.clone());
+                match picked.parser.clone() {
+                    // An explicit picker choice (built-in parsers) goes
+                    // through the native parse path.
+                    Some(parser) => self.session.open_path(path, Some(parser)),
+                    None => {
+                        // A learned custom parser runs through the scripting
+                        // engine, exactly like Parsers > Parse File; a custom
+                        // parser name is unknown to the native registry.
+                        #[cfg(feature = "scripting")]
+                        if let Some(parser) = self.settings.parser_files.parser_for(&path) {
+                            if self.scripts.parse_with(&parser, path.clone()) {
+                                continue;
+                            }
+                            self.session.push_diagnostic(
+                                delog_core::diagnostics::Diag::error(
+                                    "parser-bind",
+                                    format!(
+                                        "{}: learned parser '{parser}' is unavailable, falling back to format sniffing",
+                                        path.display(),
+                                    ),
+                                ),
+                            );
+                        }
+                        self.session.open_path(path, None);
+                    }
+                }
             }
         }
     }
@@ -3818,6 +3903,7 @@ impl eframe::App for DelogApp {
                 self.settings.scripting.auto_open_console,
                 self.settings.scripting.use_original_timestamps,
             );
+            self.learn_parser_file_extensions();
             let vehicle_profiles =
                 crate::session::vehicle_profiles::VehicleProfileLibrary::from_config_dir();
             let mut layout_effects = control_service::LayoutControlEffects::default();

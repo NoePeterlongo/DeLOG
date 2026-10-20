@@ -671,7 +671,9 @@ impl ParsersPanel {
         self.source = source.into();
     }
 
-    #[cfg(test)]
+    /// Queue a parse request without the file picker; the learned
+    /// extension-to-parser routing of the Open flow uses this to reach the
+    /// same dispatch as Parsers > Parse File.
     pub fn enqueue_parse_request(&self, request: ParseRequest) {
         self.parse_requests_tx.send(request).unwrap();
     }
