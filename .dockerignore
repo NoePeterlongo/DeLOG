@@ -1,0 +1,10 @@
+# Only rust-toolchain.toml is COPYed into the dev image; keep the build
+# context small by excluding everything else heavy.
+.git
+target
+assets
+docs
+fixtures
+third_party
+packaging
+scripts
