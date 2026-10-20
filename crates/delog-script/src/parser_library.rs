@@ -321,7 +321,13 @@ impl ParserLibrary {
         let mut names = Vec::new();
         for entry in entries {
             let entry = entry?;
-            if entry.file_type()?.is_file()
+            // Follow symlinks: a parser may live elsewhere and be linked
+            // into the library. An unresolvable link is skipped, not fatal.
+            // (fs::metadata traverses the link; DirEntry::metadata does not.)
+            let Ok(metadata) = fs::metadata(entry.path()) else {
+                continue;
+            };
+            if metadata.is_file()
                 && let Some(name) = entry.file_name().to_str()
                 && matches!(self.normalize_name(name), Ok(normalized) if normalized == name)
             {
@@ -425,6 +431,27 @@ mod tests {
                 Err(error) => panic!("failed to clean up {}: {error}", self.0.display()),
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_into_the_library_are_listed_and_loaded() {
+        let temp = TestDir::new();
+        let elsewhere = TestDir::new();
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::create_dir_all(&elsewhere.0).unwrap();
+        let library = ParserLibrary::new(&temp.0);
+        // The parser lives outside the library and is linked in.
+        let original = elsewhere.0.join("elsewhere.py");
+        fs::write(&original, "def Parse(raw_data):\n    return []\n").unwrap();
+        std::os::unix::fs::symlink(&original, temp.0.join("linked.py")).unwrap();
+        // A broken link must be skipped without breaking the listing.
+        std::os::unix::fs::symlink(temp.0.join("missing.py"), temp.0.join("broken.py")).unwrap();
+
+        let names = library.list().unwrap();
+
+        assert_eq!(names, vec!["linked.py"]);
+        assert!(library.load("linked.py").unwrap().contains("def Parse"));
     }
 
     #[test]
