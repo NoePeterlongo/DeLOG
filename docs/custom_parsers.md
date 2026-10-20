@@ -111,7 +111,9 @@ words = raw_data.view(np.uint16)   # reinterpret the underlying bytes
 - **`field_name`** - a string. The **first dot** splits topic from field: `"gps.main.lat"`
   becomes topic `gps`, field `main.lat`. A name with no dot is its own topic.
 - **`values`** - a one-dimensional NumPy-compatible array (see [dtypes](#supported-dtypes-and-nan)).
-  All fields **within the same topic** must have equal length.
+  The topic's clock defines the row count: a field that disagrees is fitted - shorter fields
+  are null-padded, longer fields are truncated - and each fit records a warning. Exact lengths
+  still produce warning-free output.
 - **`tooltip`** - a string shown when hovering the field in the data browser.
 
 ---
@@ -123,6 +125,9 @@ words = raw_data.view(np.uint16)   # reinterpret the underlying bytes
   field. Both clock fields remain visible in the browser.
 - Clock values are interpreted as **seconds** and rounded to canonical signed `i64`
   **microseconds** (DéLOG's internal time unit).
+- Rows whose clock value is non-finite (NaN/inf) have no timestamp and are **dropped from the
+  whole topic**, with a warning naming the first dropped index; a clock with no finite value
+  drops its topic. Decreasing or out-of-range clocks are errors.
 - Exact duplicate full field names are accepted for legacy compatibility: the **last value
   wins**, and DéLOG records a warning.
 
