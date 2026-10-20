@@ -1565,7 +1565,7 @@ fn run_parser_file<F>(
         return;
     }
     let mut sink = sender.file_sink();
-    match emit_parser_output(&mut sink, &source_label, output) {
+    match emit_parser_output(&mut sink, &source_label, &parser_name, output) {
         Ok(summary) => {
             drop(total_timer);
             let _ = evt_tx.send(ScriptEvent::Parser(ParserEvent::Succeeded {

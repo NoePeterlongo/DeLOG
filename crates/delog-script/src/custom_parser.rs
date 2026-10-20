@@ -64,9 +64,13 @@ pub struct ParserOutput {
 /// Fields whose length differs from their topic clock are not rejected: the
 /// clock defines the row count, shorter fields gain null tail rows, longer
 /// fields drop their extra values, and every fit emits a warning.
+///
+/// The parser name lands in the source metadata: the data browser keeps a
+/// custom parser's topic and field order instead of sorting naturally.
 pub fn emit_parser_output(
     sink: &mut dyn IngestSink,
     source_label: &str,
+    parser_name: &str,
     output: ParserOutput,
 ) -> Result<ParseSummary, String> {
     let mut topic_names = std::collections::HashSet::with_capacity(output.topics.len());
@@ -124,7 +128,15 @@ pub fn emit_parser_output(
         row_count,
         time_range,
         diagnostics,
-        ..ParseSummary::default()
+        source_meta: delog_core::identity::SourceMetadata {
+            params: vec![delog_core::identity::SourceParam {
+                name: "parser".to_owned(),
+                ty: "string".to_owned(),
+                value: parser_name.to_owned(),
+                default: None,
+            }],
+            ..Default::default()
+        },
     };
     let source = sink.open_source(source_label, SourceKind::File);
     for (schema, timestamps, columns) in prepared {
@@ -731,7 +743,7 @@ mod tests {
         let output = parse("[('AP.index',[1.,2.],'clock'),('AP.value [m]',[3.,4.],'tooltip'),('AP.value [m]',[5.,6.],'last')]" ).unwrap();
         let mut sink = CollectSink::default();
 
-        let summary = emit_parser_output(&mut sink, "flight", output).unwrap();
+        let summary = emit_parser_output(&mut sink, "flight", "my_parser", output).unwrap();
 
         assert_eq!(sink.opened, [("flight".into(), SourceKind::File)]);
         assert_eq!(sink.batches.len(), 1);
@@ -745,6 +757,17 @@ mod tests {
         assert_eq!(sink.diagnostics[0].source, Some(SourceId(7)));
         assert_eq!(summary.topic_count, 1);
         assert_eq!(summary.row_count, 2);
+        // The parser name rides along so the data browser can keep the
+        // parser's field order instead of sorting naturally.
+        assert_eq!(
+            summary
+                .source_meta
+                .params
+                .iter()
+                .find(|param| param.name == "parser")
+                .map(|param| param.value.as_str()),
+            Some("my_parser")
+        );
         assert_eq!(summary.time_range.unwrap().min_us, 1_000_000);
         assert_eq!(summary.time_range.unwrap().max_us, 2_000_000);
         assert_eq!(summary.diagnostics, 1);
@@ -768,7 +791,7 @@ mod tests {
         };
         let mut sink = CollectSink::default();
 
-        assert!(emit_parser_output(&mut sink, "bad", output).is_err());
+        assert!(emit_parser_output(&mut sink, "bad", "my_parser", output).is_err());
         assert!(sink.opened.is_empty());
         assert!(sink.batches.is_empty());
         assert!(sink.closed.is_empty());
@@ -1117,7 +1140,7 @@ mod tests {
         };
         let mut sink = CollectSink::default();
 
-        let summary = emit_parser_output(&mut sink, "flight", output).unwrap();
+        let summary = emit_parser_output(&mut sink, "flight", "my_parser", output).unwrap();
 
         assert_eq!(sink.batches.len(), 1);
         assert_eq!(summary.diagnostics, 2);
