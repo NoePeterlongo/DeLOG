@@ -211,6 +211,15 @@ impl BrowserModel {
             let mut topics = Vec::new();
             let mut source_rows = 0u64;
             let mut source_range: Option<TimeRange> = None;
+            // A custom-parsed source carries its parser's name in the
+            // metadata: its topic and field order is the parser's proposal,
+            // so the browser keeps it instead of sorting naturally.
+            let keep_source_order = source
+                .entry
+                .meta
+                .params
+                .iter()
+                .any(|param| param.name == "parser");
 
             for &topic_id in source.topics.iter() {
                 let Some(topic) = snapshot.topic(topic_id) else {
@@ -255,7 +264,9 @@ impl BrowserModel {
                         }
                     })
                     .collect();
-                fields.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+                if !keep_source_order {
+                    fields.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+                }
 
                 topics.push(TopicNode {
                     id: topic_id,
@@ -265,7 +276,9 @@ impl BrowserModel {
                     search_path: topic_search_path,
                 });
             }
-            topics.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+            if !keep_source_order {
+                topics.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+            }
 
             let offset_us = source.entry.offset_us;
             sources.push(SourceNode {
@@ -2626,6 +2639,91 @@ mod tests {
             .map(|f| f.name.as_str())
             .collect();
         assert_eq!(fields, vec!["Y2", "Y10"]);
+    }
+
+    #[test]
+    fn custom_parser_sources_keep_their_own_order() {
+        use delog_core::identity::{SourceMetadata, SourceParam};
+
+        let mut identity = IdentityRegistry::new();
+        let source = identity.add_source("flight");
+        let gps10 = identity.add_topic(source, "GPS[10]").unwrap();
+        let gps2 = identity.add_topic(source, "GPS[2]").unwrap();
+        // Insertion order differs from natural order on purpose.
+        identity.add_field(gps10, "Y10").unwrap();
+        identity.add_field(gps10, "Y2").unwrap();
+        identity.add_field(gps2, "A").unwrap();
+        identity.set_source_metadata(
+            source,
+            SourceMetadata {
+                params: vec![SourceParam {
+                    name: "parser".to_owned(),
+                    ty: "string".to_owned(),
+                    value: "my_parser".to_owned(),
+                    default: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let schema10 = Arc::new(
+            TopicSchema::new(
+                "GPS[10]",
+                [
+                    FieldSchema::new("Y10", DataType::Float64, None::<String>, 1.0).unwrap(),
+                    FieldSchema::new("Y2", DataType::Float64, None::<String>, 1.0).unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let schema2 = Arc::new(
+            TopicSchema::new(
+                "GPS[2]",
+                [FieldSchema::new("A", DataType::Float64, None::<String>, 1.0).unwrap()],
+            )
+            .unwrap(),
+        );
+        let chunk10 = Arc::new(
+            Chunk::try_new(
+                Int64Array::from(vec![0]),
+                vec![
+                    Arc::new(Float64Array::from(vec![1.0])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![2.0])) as ArrayRef,
+                ],
+                &schema10,
+            )
+            .unwrap(),
+        );
+        let chunk2 = Arc::new(
+            Chunk::try_new(
+                Int64Array::from(vec![0]),
+                vec![Arc::new(Float64Array::from(vec![1.0])) as ArrayRef],
+                &schema2,
+            )
+            .unwrap(),
+        );
+        let store10 = Arc::new(TopicStore::from_chunks(schema10, [chunk10]).unwrap());
+        let store2 = Arc::new(TopicStore::from_chunks(schema2, [chunk2]).unwrap());
+        let snapshot =
+            StoreSnapshot::from_registry(&identity, [(gps10, store10), (gps2, store2)], 0).unwrap();
+
+        let model = BrowserModel::from_snapshot(&snapshot);
+        let topics: Vec<_> = model.sources[0]
+            .topics
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            topics,
+            vec!["GPS[10]", "GPS[2]"],
+            "a parser's topic order is its proposal, not sorted"
+        );
+        let fields: Vec<_> = model.sources[0].topics[0]
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(fields, vec!["Y10", "Y2"]);
     }
 
     #[test]

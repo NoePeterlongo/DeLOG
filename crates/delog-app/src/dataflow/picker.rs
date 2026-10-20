@@ -78,8 +78,8 @@ pub fn field_options(snapshot: &StoreSnapshot, selector: &FieldSelector) -> Fiel
             push_unique(&mut options.sources, &source.entry.label);
         }
     }
-    options.topics.sort();
-    options.fields.sort();
+    // Store order is the source's order: a custom parser's field order is
+    // meaningful, so the options keep it instead of alphabetizing.
     options
 }
 
@@ -249,6 +249,41 @@ mod tests {
         )
     }
 
+    /// A topic of plain float fields in the given order, for order tests.
+    fn numeric_topic(
+        identity: &mut IdentityRegistry,
+        source: SourceId,
+        name: &str,
+        fields: &[&str],
+    ) -> (TopicId, Arc<TopicStore>) {
+        let topic = identity.add_topic(source, name).unwrap();
+        for field in fields {
+            identity.add_field(topic, *field).unwrap();
+        }
+        let schema = Arc::new(
+            TopicSchema::new(
+                name,
+                fields
+                    .iter()
+                    .map(|field| {
+                        FieldSchema::new(*field, DataType::Float64, None::<String>, 1.0).unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|_| Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])) as ArrayRef)
+            .collect();
+        let chunk = Arc::new(
+            Chunk::try_new(Int64Array::from(vec![100, 200, 300]), columns, &schema).unwrap(),
+        );
+        (
+            topic,
+            Arc::new(TopicStore::from_chunks(schema, [chunk]).unwrap()),
+        )
+    }
+
     pub(crate) fn snapshot_long_names() -> StoreSnapshot {
         let mut identity = IdentityRegistry::new();
         let source = identity.add_source("vehicle_01_long_source_label_for_layout_tests_07");
@@ -334,7 +369,7 @@ mod tests {
         let options = field_options(&snapshot, &imu_selector());
 
         assert_eq!(options.sources, ["flight_01", "flight_02"]);
-        assert_eq!(options.topics, ["GPS", "IMU[0]", "IMU[1]"]);
+        assert_eq!(options.topics, ["IMU[0]", "IMU[1]", "GPS"]);
         assert_eq!(
             options.fields,
             ["AccX"],
@@ -350,7 +385,36 @@ mod tests {
 
         let options = field_options(&snapshot, &selector);
 
-        assert_eq!(options.topics, ["GPS", "IMU[0]"]);
+        assert_eq!(options.topics, ["IMU[0]", "GPS"]);
+    }
+
+    #[test]
+    fn field_options_keep_the_source_order_instead_of_alphabetizing() {
+        // A custom parser proposes its own order; the picker must not
+        // reorder the topics or the fields of the selected topic.
+        let mut identity = IdentityRegistry::new();
+        let source = identity.add_source("flight");
+        let stores = [
+            numeric_topic(&mut identity, source, "zulu", &["mike", "alpha", "zulu"]),
+            numeric_topic(&mut identity, source, "alpha", &["only"]),
+        ];
+        let snapshot = StoreSnapshot::from_registry(&identity, stores, 1).unwrap();
+
+        let mut selector = FieldSelector {
+            source: Some("flight".to_owned()),
+            topic: "zulu".to_owned(),
+            instance: None,
+            field: "mike".to_owned(),
+        };
+
+        let options = field_options(&snapshot, &selector);
+        assert_eq!(options.topics, ["zulu", "alpha"], "store order, not sorted");
+        assert_eq!(options.fields, ["mike", "alpha", "zulu"]);
+
+        // The retarget default is the store's first field, not the
+        // alphabetically first one.
+        retarget_topic(&snapshot, &mut selector, "alpha");
+        assert_eq!(selector.field, "only");
     }
 
     #[test]

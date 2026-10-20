@@ -212,6 +212,9 @@ This produces an `imu` topic clocked by `imu.rtc`, with fields `ax`, `ay`, `az`.
 - **Chosen explicitly, then remembered.** Pick a custom parser explicitly the first time
   (**Parsers ▸ Parse File**); after a successful parse, **File ▸ Open** routes the file's
   extension through that parser automatically (built-in formats never learn).
+- **Field order is yours.** The data browser keeps the order your `Parse` function returns -
+  topics and fields appear exactly as proposed - while built-in formats are sorted
+  naturally.
 - **Not sandboxed.** See *Execution model & safety* above.
 
 See also: **[Scripting](scripting.md)** for derived-field scripts and live transforms that
