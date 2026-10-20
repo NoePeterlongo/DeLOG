@@ -2294,6 +2294,7 @@ impl DelogApp {
                 CommandId::DisconnectLive => {
                     self.session.stop_all_live();
                 }
+                CommandId::ResetLiveSession => self.reset_live_session(snapshot),
                 CommandId::CancelTasks => {
                     self.cancel_sequences();
                     self.session.cancel_all();
@@ -2597,6 +2598,49 @@ impl DelogApp {
         self.traj_dirty = true;
         for diag in layout.diagnostics {
             self.session.push_diagnostic(diag);
+        }
+    }
+
+    /// Live-session reset: drop every live and live-derived source, then
+    /// respawn the links so the next flight restarts at t=0. Layouts,
+    /// plots, and vehicle profiles keep their configuration and re-resolve
+    /// when telemetry returns; marker and annotation time values are kept
+    /// as part of the layout.
+    fn reset_live_session(&mut self, snapshot: &delog_core::snapshot::StoreSnapshot) {
+        // Pin the configured plots to their topic/field names before the
+        // sources vanish, so they re-resolve when the respawned links
+        // re-ingest the same messages.
+        self.workspace.ghost_live_traces(snapshot);
+        #[cfg(feature = "scripting")]
+        self.scripts.reset_live_transforms();
+        let sender = self.session.ingest_sender();
+        for source in self.dataflow.reset_live_publications(&sender) {
+            self.session.remove_source(source);
+        }
+        for flow in self.headless_flows.values_mut() {
+            let _ = flow.controller.stop_owned(&sender);
+            flow.controller.reset_live(&sender);
+        }
+        let links: Vec<_> = self
+            .session
+            .live_statuses()
+            .into_iter()
+            .map(|status| (status.endpoint, status.recording))
+            .collect();
+        self.session.stop_all_live();
+        for source in live_source_ids(snapshot) {
+            self.session.remove_source(source);
+        }
+        for (endpoint, recording) in links {
+            // A respawned link records into a fresh timestamped file so the
+            // previous flight's recording is never overwritten.
+            let recording = recording
+                .as_deref()
+                .map(ConnectionDialog::next_recording_path);
+            if let Err(err) = self.session.start_live(endpoint, recording) {
+                self.session
+                    .push_diagnostic(delog_core::diagnostics::Diag::error("live-open", err));
+            }
         }
     }
 
@@ -5312,6 +5356,24 @@ fn open_source_ids(
         .sources
         .iter()
         .filter(|source| !source.entry.removed)
+        .map(|source| source.entry.id)
+        .collect()
+}
+
+fn live_source_ids(
+    snapshot: &delog_core::snapshot::StoreSnapshot,
+) -> Vec<delog_core::identity::SourceId> {
+    use delog_core::identity::SourceKind;
+    snapshot
+        .sources
+        .iter()
+        .filter(|source| {
+            !source.entry.removed
+                && matches!(
+                    source.entry.kind,
+                    SourceKind::Live | SourceKind::LiveDerived
+                )
+        })
         .map(|source| source.entry.id)
         .collect()
 }

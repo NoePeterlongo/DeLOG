@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use delog_core::identity::SourceId;
 use delog_core::ingest::IngestSender;
 use delog_core::snapshot::StoreSnapshot;
 use delog_flow::graph::Graph;
@@ -208,6 +209,15 @@ impl DataFlowUi {
             logs.extend(editor.drive(ctx, snapshot, sender, live_connected, settings));
         }
         logs
+    }
+
+    /// Live-session reset: stop every editor's live publication and return
+    /// the closed live-derived sources so the caller can drop their data.
+    pub fn reset_live_publications(&mut self, sender: &IngestSender) -> Vec<SourceId> {
+        self.editors
+            .values_mut()
+            .filter_map(|editor| editor.controller.stop(sender))
+            .collect()
     }
 
     fn active_editor(&self) -> &DataFlowEditor {

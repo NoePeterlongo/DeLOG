@@ -323,6 +323,14 @@ impl ScriptsPanel {
         }
     }
 
+    /// Live-session reset: unregister every live transform and remove its
+    /// live-derived source.
+    pub fn reset_live_transforms(&mut self) {
+        if let Some(engine) = &self.engine {
+            let _ = engine.send(ScriptCommand::UnregisterAllLive);
+        }
+    }
+
     pub fn edit_named(&mut self, name: &str) {
         match self.library.load(name) {
             Ok(source) => {

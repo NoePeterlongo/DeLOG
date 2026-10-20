@@ -93,6 +93,9 @@ pub enum ScriptCommand {
     UnregisterLive {
         name: String,
     },
+    /// Unregister the live transforms of every script and remove their
+    /// live-derived sources (live-session reset).
+    UnregisterAllLive,
     ValidateParser {
         name: String,
         source: String,
@@ -967,6 +970,38 @@ fn run_one_transform(
     result
 }
 
+// The per-name teardown shared by `UnregisterLive` and `UnregisterAllLive`:
+// stop running the callbacks and tombstone the appendable live-derived
+// source, the declarative source, and the markers owned by the script.
+#[allow(clippy::too_many_arguments)]
+fn unregister_live_for(
+    name: &str,
+    sender: &IngestSender,
+    evt_tx: &Sender<ScriptEvent>,
+    active_transforms: &mut HashMap<String, Vec<ActiveTransform>>,
+    active_live: &Arc<Mutex<HashMap<String, Vec<LiveTransformSpec>>>>,
+    live_sources: &mut HashMap<String, SourceId>,
+    active_operations: &mut HashMap<String, Vec<ActiveOperation>>,
+    active_declarative: &Arc<Mutex<HashSet<String>>>,
+    declarative_sources: &mut HashMap<String, SourceId>,
+) {
+    active_transforms.remove(name);
+    active_live.lock().unwrap().remove(name);
+    if let Some(prev) = live_sources.remove(name) {
+        sender.remove_source(prev);
+    }
+    active_operations.remove(name);
+    active_declarative.lock().unwrap().remove(name);
+    if let Some(previous) = declarative_sources.remove(name) {
+        sender.remove_source(previous);
+    }
+    let _ = evt_tx.send(ScriptEvent::Control(vec![ControlRequest::Markers(
+        MarkerRequest::RemoveOwned {
+            owner: name.to_owned(),
+        },
+    )]));
+}
+
 /// Handle one command. Returns `true` if the worker should shut down.
 #[allow(clippy::too_many_arguments)]
 fn handle_command(
@@ -1294,25 +1329,46 @@ fn handle_command(
             ScriptCommand::UnregisterLive { name } => {
                 // Same teardown as the empty-rerun path: stop running the
                 // callbacks and tombstone the appendable live-derived source.
-                active_transforms.remove(&name);
-                active_live.lock().unwrap().remove(&name);
-                if let Some(prev) = live_sources.remove(&name) {
-                    sender.remove_source(prev);
-                }
-                active_operations.remove(&name);
-                active_declarative.lock().unwrap().remove(&name);
-                if let Some(previous) = declarative_sources.remove(&name) {
-                    sender.remove_source(previous);
-                }
-                let _ = evt_tx.send(ScriptEvent::Control(vec![ControlRequest::Markers(
-                    MarkerRequest::RemoveOwned {
-                        owner: name.clone(),
-                    },
-                )]));
+                unregister_live_for(
+                    &name,
+                    sender,
+                    evt_tx,
+                    active_transforms,
+                    active_live,
+                    live_sources,
+                    active_operations,
+                    active_declarative,
+                    declarative_sources,
+                );
                 // Console confirmation; carries no command-completion semantics.
                 let _ = evt_tx.send(ScriptEvent::Output(format!(
                     "# unregistered live transform '{name}'\n"
                 )));
+            }
+            ScriptCommand::UnregisterAllLive => {
+                // Live-session reset: one UnregisterLive teardown per script
+                // with live activity.
+                let mut names: Vec<String> = active_transforms.keys().cloned().collect();
+                names.extend(live_sources.keys().cloned());
+                names.sort();
+                names.dedup();
+                for name in names {
+                    unregister_live_for(
+                        &name,
+                        sender,
+                        evt_tx,
+                        active_transforms,
+                        active_live,
+                        live_sources,
+                        active_operations,
+                        active_declarative,
+                        declarative_sources,
+                    );
+                    // Console confirmation; carries no command-completion semantics.
+                    let _ = evt_tx.send(ScriptEvent::Output(format!(
+                        "# unregistered live transform '{name}'\n"
+                    )));
+                }
             }
             ScriptCommand::Eval(src) => {
                 let _control = crate::control::install_host(control_host.lock().unwrap().clone());
@@ -2853,6 +2909,90 @@ def f(batch):
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(settled, "the script:live source is removed on unregister");
+
+        drop(engine);
+        drop(sender);
+        let _ = ingest_thread.join();
+    }
+
+    #[test]
+    fn unregister_all_live_tombstones_every_script_source() {
+        let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use delog_core::ingest::ingest_channel;
+        use delog_core::ingestor::{Ingestor, NullObserver};
+
+        let ingestor = Ingestor::new(NullObserver);
+        let write_store = ingestor.store();
+        let (sender, receiver) = ingest_channel();
+        let ingest_thread = std::thread::spawn(move || ingestor.run(receiver));
+        let engine = ScriptEngine::spawn(
+            Arc::new(DataStore::new()),
+            sender.clone(),
+            test_metrics(),
+            delog_api::params::shared_empty(),
+        );
+
+        let script = r#"
+@delog.live_transform(topic="A", fields=["v"], output_topic="B")
+def f(batch):
+    return {"x": batch.v}
+"#;
+        for name in ["one", "two"] {
+            let _ = engine.send(ScriptCommand::RunScript {
+                name: name.into(),
+                source: script.into(),
+            });
+            loop {
+                match engine.recv_blocking() {
+                    ScriptEvent::Done => break,
+                    ScriptEvent::Error(e) => panic!("unexpected error: {e}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                engine.has_live_transform(name),
+                "the transform is registered after running the script"
+            );
+        }
+
+        let _ = engine.send(ScriptCommand::UnregisterAllLive);
+        let mut unregistered = 0;
+        while unregistered < 2 {
+            match engine.recv_blocking() {
+                ScriptEvent::Output(s) if s.contains("unregistered") => unregistered += 1,
+                ScriptEvent::Error(e) => panic!("unexpected error: {e}"),
+                _ => {}
+            }
+        }
+        for name in ["one", "two"] {
+            assert!(
+                !engine.has_live_transform(name),
+                "the transform is gone after UnregisterAllLive"
+            );
+        }
+
+        // Both live-derived sources are tombstoned (`remove_source` publishes
+        // it).
+        let removed = |snap: &StoreSnapshot| -> usize {
+            ["script:one", "script:two"]
+                .iter()
+                .filter(|label| {
+                    snap.sources
+                        .iter()
+                        .find(|s| &s.entry.label == *label)
+                        .is_some_and(|s| s.entry.removed)
+                })
+                .count()
+        };
+        let mut settled = false;
+        for _ in 0..100 {
+            if removed(&write_store.load()) == 2 {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(settled, "both script sources are removed on reset");
 
         drop(engine);
         drop(sender);

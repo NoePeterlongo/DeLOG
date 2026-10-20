@@ -214,6 +214,17 @@ pub fn show(
                     commands.push(AppCommand::DisconnectLink(status.index));
                 }
             }
+            if !model.live_statuses.is_empty()
+                && components::icon_button(
+                    ui,
+                    crate::ui::icons::rotate_ccw(),
+                    CommandId::ResetLiveSession.spec().label,
+                    false,
+                )
+                .clicked()
+            {
+                commands.push(AppCommand::Static(CommandId::ResetLiveSession));
+            }
             if let LoadStatusView::Active { label, progress } = &model.load {
                 ui.separator();
                 ui.label(label);
@@ -1296,6 +1307,7 @@ mod tests {
             CommandId::EqualizePlots,
             CommandId::TogglePlayheadSnap,
             CommandId::DisconnectLive,
+            CommandId::ResetLiveSession,
             CommandId::CloseAllSources,
         ] {
             assert!(
@@ -1305,6 +1317,12 @@ mod tests {
         }
         assert!(
             !CommandId::DisconnectLive
+                .spec()
+                .routes
+                .contains(&crate::shell::app::commands::AccessRoute::ClassicMenu)
+        );
+        assert!(
+            !CommandId::ResetLiveSession
                 .spec()
                 .routes
                 .contains(&crate::shell::app::commands::AccessRoute::ClassicMenu)

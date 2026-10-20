@@ -61,6 +61,14 @@ impl CommandId {
                     Palette
                 )
             }
+            ResetLiveSession => spec!(
+                "Reset live session",
+                Source,
+                None,
+                "restart clear new flight simulation data",
+                Header,
+                Palette
+            ),
             CancelTasks => spec!(
                 "Cancel active tasks",
                 Source,
