@@ -120,6 +120,9 @@ pub struct ScriptsPanel {
     use_original_timestamps: bool,
     pending_logs: Vec<PendingLog>,
     pending_control_batches: Vec<Vec<ControlRequest>>,
+    /// Successful custom-parser file reads, drained by the app to learn the
+    /// extension-to-parser routing used by the plain Open flow.
+    parsed_parser_files: Vec<(String, std::path::PathBuf)>,
     completion: ReplCompletion,
     history: ReplHistory,
     ctx: egui::Context,
@@ -163,6 +166,7 @@ impl ScriptsPanel {
             use_original_timestamps: false,
             pending_logs: Vec::new(),
             pending_control_batches: Vec::new(),
+            parsed_parser_files: Vec::new(),
             completion: ReplCompletion::new(),
             history: ReplHistory::new(),
             ctx,
@@ -294,6 +298,29 @@ impl ScriptsPanel {
             .map(ScriptEngine::cancel_parsers)
             .unwrap_or(Ok(()));
         self.finish_cancel_dispatch(result);
+    }
+
+    /// Queue a custom-parser read of `path` through the normal parse
+    /// dispatch (same path as Parsers > Parse File, without the picker).
+    /// Returns false, with the load failure in `status`, when the parser
+    /// cannot be loaded; a queued request waits for the engine like a
+    /// picker request does.
+    pub fn parse_with(&mut self, parser_name: &str, path: std::path::PathBuf) -> bool {
+        match self.parsers.load_source(parser_name) {
+            Ok(source) => {
+                self.parsers
+                    .enqueue_parse_request(crate::ingest::parsers::ParseRequest {
+                        parser_name: parser_name.to_owned(),
+                        source,
+                        path,
+                    });
+                true
+            }
+            Err(error) => {
+                self.status = format!("load parser {parser_name}: {error}");
+                false
+            }
+        }
     }
 
     pub fn edit_named(&mut self, name: &str) {
@@ -610,11 +637,21 @@ impl ScriptsPanel {
         result: Result<(), String>,
     ) {
         match result {
-            Ok(()) => self.parsers.mark_parse_dispatched(parser_name, path),
+            Ok(()) => {
+                self.parsed_parser_files
+                    .push((parser_name.to_owned(), path.to_owned()));
+                self.parsers.mark_parse_dispatched(parser_name, path);
+            }
             Err(error) => self
                 .parsers
                 .parse_dispatch_failed(parser_name, path, &error),
         }
+    }
+
+    /// Files successfully read through a custom parser since the last drain;
+    /// the app learns the extension-to-parser routing from them.
+    pub fn take_parsed_parser_files(&mut self) -> Vec<(String, std::path::PathBuf)> {
+        std::mem::take(&mut self.parsed_parser_files)
     }
 
     fn finish_cancel_dispatch(&mut self, result: Result<(), String>) {
@@ -1506,6 +1543,69 @@ mod tests {
         }));
 
         assert!(panel.ordinary_dispatch_enabled());
+    }
+
+    #[test]
+    fn successful_parser_reads_report_the_parsed_files_for_extension_learning() {
+        let root = std::env::temp_dir().join(format!(
+            "delog-scripts-learned-parse-{}",
+            std::process::id()
+        ));
+        let mut panel = ScriptsPanel::new(
+            root.join("scripts"),
+            root.join("parsers"),
+            root.join("params.json"),
+            egui::Context::default(),
+        );
+        assert!(panel.take_parsed_parser_files().is_empty());
+
+        panel.finish_parse_dispatch("raw.py", std::path::Path::new("flight.raw"), Ok(()));
+        panel.finish_parse_dispatch(
+            "raw.py",
+            std::path::Path::new("broken.raw"),
+            Err("boom".into()),
+        );
+        let learned = panel.take_parsed_parser_files();
+        assert_eq!(
+            learned,
+            vec![("raw.py".to_owned(), PathBuf::from("flight.raw"))],
+            "only successful reads are reported"
+        );
+        assert!(panel.take_parsed_parser_files().is_empty());
+    }
+
+    #[test]
+    fn parse_with_queues_the_parser_and_reports_missing_ones() {
+        let root =
+            std::env::temp_dir().join(format!("delog-scripts-parse-with-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("parsers")).unwrap();
+        std::fs::write(
+            root.join("parsers/raw.py"),
+            "def Parse(raw_data):\n    return []\n",
+        )
+        .unwrap();
+        let mut panel = ScriptsPanel::new(
+            root.join("scripts"),
+            root.join("parsers"),
+            root.join("params.json"),
+            egui::Context::default(),
+        );
+
+        let path = PathBuf::from("flight.raw");
+        assert!(panel.parse_with("raw.py", path.clone()));
+        let commands = panel.take_ready_parser_commands();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0].command(),
+            ScriptCommand::ParseFile { parser_name, path: command_path, .. }
+                if parser_name == "raw.py" && command_path.as_path() == path.as_path()
+        ));
+
+        assert!(!panel.parse_with("missing.py", PathBuf::from("x.y")));
+        assert!(panel.status.contains("missing.py"));
+        assert!(panel.take_ready_parser_commands().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

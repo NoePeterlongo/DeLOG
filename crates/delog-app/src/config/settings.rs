@@ -92,6 +92,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub scripting: ScriptingSettings,
     #[serde(default)]
+    pub parser_files: ParserFileSettings,
+    #[serde(default)]
     pub dataflow: DataFlowSettings,
     #[serde(default)]
     pub updates: UpdateSettings,
@@ -130,6 +132,7 @@ impl Default for AppSettings {
             font: FontOverride::default(),
             auto_open_diagnostics: false,
             scripting: ScriptingSettings::default(),
+            parser_files: ParserFileSettings::default(),
             updates: UpdateSettings::default(),
             dataflow: DataFlowSettings::default(),
         }
@@ -733,6 +736,42 @@ pub struct ScriptingSettings {
     pub auto_open_console: AutoOpenScriptingConsole,
     #[serde(default)]
     pub use_original_timestamps: bool,
+}
+
+/// Extension-to-parser routing learned from explicit "open with parser" use:
+/// picking a parser for a file teaches the Open flow to use that parser for
+/// the file's extension, so exotic log formats open without re-picking.
+/// Built-in sniffed extensions are never learned (they keep the built-in
+/// parsers even after a deliberate custom-parser read). The field itself is
+/// unconditional so the settings file stays identical across builds; only
+/// the routing runs require the embedded-Python feature.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ParserFileSettings {
+    /// Lowercase extension, no dot → custom parser name.
+    pub parser_by_extension: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(feature = "scripting")]
+impl ParserFileSettings {
+    /// Extensions handled by the built-in Rust parsers; they keep format
+    /// sniffing even after a deliberate custom-parser read.
+    const BUILTIN_EXTENSIONS: &[&str] = &["bin", "ulg", "ulog", "tlog", "parquet"];
+
+    /// The extension of a custom-parsed file worth remembering: lowercase,
+    /// no dot; `None` for built-in sniffed formats and extensionless files.
+    pub fn learnable_extension(path: &std::path::Path) -> Option<String> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        (!extension.is_empty() && !Self::BUILTIN_EXTENSIONS.contains(&extension.as_str()))
+            .then_some(extension)
+    }
+
+    /// The custom parser the plain Open flow routes `path` through;
+    /// `None` keeps the built-in format sniffing.
+    pub fn parser_for(&self, path: &std::path::Path) -> Option<String> {
+        let extension = Self::learnable_extension(path)?;
+        self.parser_by_extension.get(&extension).cloned()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1497,6 +1536,88 @@ mod tests {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.scene3d.map_provider, MapProviderId::None);
         assert_eq!(settings.scene3d.tile_cache_limit_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parser_file_settings_round_trip_and_default_from_legacy_config() {
+        let legacy: AppSettings =
+            serde_json::from_str("{\"scene3d\":{\"map_provider\":\"none\"}}").unwrap();
+        assert!(legacy.parser_files.parser_by_extension.is_empty());
+
+        let mut settings = AppSettings::default();
+        settings
+            .parser_files
+            .parser_by_extension
+            .insert("foo".to_owned(), "my_parser".to_owned());
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"parser_by_extension\":{\"foo\":\"my_parser\"}"));
+        assert_eq!(
+            serde_json::from_str::<AppSettings>(&json).unwrap(),
+            settings
+        );
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn learnable_extension_skips_builtin_formats() {
+        use std::path::Path;
+
+        assert_eq!(
+            ParserFileSettings::learnable_extension(Path::new("/logs/flight.ulg")),
+            None,
+            "built-in formats keep format sniffing"
+        );
+        assert_eq!(
+            ParserFileSettings::learnable_extension(Path::new("/logs/data.BIN")),
+            None
+        );
+        assert_eq!(
+            ParserFileSettings::learnable_extension(Path::new("/logs/data.tlog")),
+            None
+        );
+        assert_eq!(
+            ParserFileSettings::learnable_extension(Path::new("/logs/data.parquet")),
+            None
+        );
+        assert_eq!(
+            ParserFileSettings::learnable_extension(Path::new("/logs/README")),
+            None
+        );
+        assert_eq!(
+            ParserFileSettings::learnable_extension(Path::new("/logs/telemetry.FOO")),
+            Some("foo".to_owned()),
+            "exotic extensions learn, lowercased"
+        );
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn parser_for_routes_learned_extensions_only() {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        let settings = ParserFileSettings {
+            parser_by_extension: BTreeMap::from([("foo".to_owned(), "my_parser".to_owned())]),
+        };
+        assert_eq!(
+            settings.parser_for(Path::new("/logs/telemetry.foo")),
+            Some("my_parser".to_owned())
+        );
+        assert_eq!(
+            settings.parser_for(Path::new("/logs/telemetry.FOO")),
+            Some("my_parser".to_owned()),
+            "lookup is case-insensitive on the picked file"
+        );
+        assert_eq!(
+            settings.parser_for(Path::new("/logs/flight.ulg")),
+            None,
+            "built-in formats never route through a learned parser"
+        );
+        assert_eq!(settings.parser_for(Path::new("/logs/x.bar")), None);
+        assert_eq!(
+            ParserFileSettings::default().parser_for(Path::new("/logs/x.foo")),
+            None
+        );
     }
 
     #[test]
