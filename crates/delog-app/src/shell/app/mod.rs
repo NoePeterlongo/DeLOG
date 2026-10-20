@@ -3288,6 +3288,18 @@ impl eframe::App for DelogApp {
             for field in pruned {
                 self.caches.unpin(field);
             }
+            // Vehicles hold dense source/field ids: after a live-session
+            // reset they rebind onto the recreated same-label source.
+            let mut rebound = 0;
+            for vehicle in &mut self.vehicles {
+                if crate::scene3d::vehicle::rebind_to_recreated_source(vehicle, &snapshot) {
+                    rebound += 1;
+                }
+            }
+            if rebound > 0 {
+                self.vehicle_revision = self.vehicle_revision.wrapping_add(1);
+                self.traj_dirty = true;
+            }
             if resolved > 0 {
                 self.session
                     .push_diagnostic(delog_core::diagnostics::Diag::info(
