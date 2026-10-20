@@ -10,7 +10,7 @@ use std::time::Instant;
 #[cfg(feature = "scripting")]
 use delog_api::control::{AnnotationInfo, PlotInfo};
 use delog_cache::CacheManager;
-use delog_core::identity::FieldId;
+use delog_core::identity::{FieldId, SourceKind};
 use delog_core::snapshot::StoreSnapshot;
 
 use crate::map::mercator;
@@ -347,6 +347,26 @@ impl Workspace {
             }
         }
         removed
+    }
+
+    /// Live-session reset: turn every trace reading a live or live-derived
+    /// (non-script) source into a ghost pinned to that source label, so it
+    /// re-resolves when the respawned links re-ingest the same topic and
+    /// field. Script sources and script-owned traces are left to the prune
+    /// path, which ghosts them natively.
+    pub fn ghost_live_traces(&mut self, snapshot: &StoreSnapshot) {
+        for pane in self.plot_panes_mut() {
+            let mut i = 0;
+            while i < pane.traces.len() {
+                match live_ghost_from_trace(snapshot, pane, i) {
+                    Some(ghost) => {
+                        pane.traces.remove(i);
+                        pane.add_ghost(ghost);
+                    }
+                    None => i += 1,
+                }
+            }
+        }
     }
 
     pub fn add_trace_to_first_plot(&mut self, field: FieldId) -> bool {
@@ -2329,6 +2349,46 @@ fn script_ghost_from_removed_trace(
     let topic = snapshot.topic(field.topic)?;
     let source = snapshot.source(topic.entry.source)?;
     if !source.entry.removed || !source.entry.label.starts_with("script:") {
+        return None;
+    }
+    let (text_filter, text_offsets) = take_text_state(pane, trace.field);
+    Some(GhostTrace {
+        source: Some(source.entry.label.clone()),
+        topic: topic.entry.name.clone(),
+        field: field.name.clone(),
+        color: trace.color,
+        width_px: trace.width_px,
+        mode: trace.mode,
+        visible: trace.visible,
+        text_filter,
+        text_offsets,
+    })
+}
+
+// Live-session reset counterpart of `script_ghost_from_removed_trace`: the
+// fields are still live at call time (the sources are removed right after),
+// so the guard is the source kind, not the removed flag.
+fn live_ghost_from_trace(
+    snapshot: &StoreSnapshot,
+    pane: &mut PlotPane,
+    trace_index: usize,
+) -> Option<GhostTrace> {
+    let trace = pane.traces.get(trace_index).cloned()?;
+    #[cfg(feature = "scripting")]
+    if trace.owner.is_some() {
+        return None;
+    }
+    let field = snapshot
+        .fields
+        .get(trace.field.index())
+        .filter(|field| field.id == trace.field)?;
+    let topic = snapshot.topic(field.topic)?;
+    let source = snapshot.source(topic.entry.source)?;
+    if !matches!(
+        source.entry.kind,
+        SourceKind::Live | SourceKind::LiveDerived
+    ) || source.entry.label.starts_with("script:")
+    {
         return None;
     }
     let (text_filter, text_offsets) = take_text_state(pane, trace.field);

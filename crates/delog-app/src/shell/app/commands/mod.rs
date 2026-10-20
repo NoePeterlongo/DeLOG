@@ -15,6 +15,7 @@ pub enum CommandId {
     SyncSources,
     CloseAllSources,
     DisconnectLive,
+    ResetLiveSession,
     CancelTasks,
     ExportData,
     ExportDiagnostics,
@@ -286,6 +287,7 @@ impl CommandId {
         Self::SyncSources,
         Self::CloseAllSources,
         Self::DisconnectLive,
+        Self::ResetLiveSession,
         Self::CancelTasks,
         Self::ExportData,
         Self::ExportDiagnostics,
@@ -334,10 +336,9 @@ impl CommandId {
     pub const fn classic_menu_owner(self) -> ClassicMenuOwner {
         use CommandId::*;
         match self {
-            Open | ConnectLive | CloseAllSources | DisconnectLive | CancelTasks | ExportData
-            | ExportDiagnostics | ExportProfiling | ExportWorkspacePng | Exit => {
-                ClassicMenuOwner::File
-            }
+            Open | ConnectLive | CloseAllSources | DisconnectLive | ResetLiveSession
+            | CancelTasks | ExportData | ExportDiagnostics | ExportProfiling
+            | ExportWorkspacePng | Exit => ClassicMenuOwner::File,
             ToggleDataBrowser
             | ToggleInspector
             | ToggleScene3d
@@ -370,6 +371,9 @@ impl CommandId {
                 CommandAvailability::Disabled("No source is open")
             }
             Self::DisconnectLive if context.live_link_count == 0 => {
+                CommandAvailability::Disabled("No live connection is active")
+            }
+            Self::ResetLiveSession if context.live_link_count == 0 => {
                 CommandAvailability::Disabled("No live connection is active")
             }
             Self::CancelTasks if !context.has_active_tasks => {
@@ -519,6 +523,10 @@ mod tests {
         ));
         assert!(matches!(
             CommandId::DisconnectLive.availability(&empty),
+            CommandAvailability::Disabled(_)
+        ));
+        assert!(matches!(
+            CommandId::ResetLiveSession.availability(&empty),
             CommandAvailability::Disabled(_)
         ));
         assert!(matches!(
