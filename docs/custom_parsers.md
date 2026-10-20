@@ -196,11 +196,17 @@ This produces an `imu` topic clocked by `imu.rtc`, with fields `ax`, `ay`, `az`.
 - **Input is always `float32` bytes.** You get `numpy.fromfile(..., dtype=float32)` semantics
   and must reinterpret with `.view(...)` for other layouts; a partial trailing `float32` is
   dropped.
-- **Equal length per topic.** Every field in a topic must match its clock's length.
+- **Fields fit the clock.** The clock (`.rtc`/`.index`) defines each topic's row count. A field
+  shorter than its clock is padded with null rows at the end (a visible gap on plots); a longer
+  field drops its extra values. Every fit raises a warning in the Logging dock naming the
+  field - fix the parser when the mismatch is not intentional.
 - **Clocks are seconds.** `.rtc`/`.index` values are read as seconds and converted to µs;
-  scale accordingly.
-- **Not auto-detected.** You always pick a custom parser explicitly from
-  **Parsers ▸ Parse File**.
+  scale accordingly. Rows whose clock value is non-finite (NaN/inf) have no timestamp and are
+  dropped from the whole topic, with a warning naming the first dropped index; a topic whose
+  clock has no finite value at all is dropped. Out-of-range and decreasing clocks stay errors.
+- **Chosen explicitly, then remembered.** Pick a custom parser explicitly the first time
+  (**Parsers ▸ Parse File**); after a successful parse, **File ▸ Open** routes the file's
+  extension through that parser automatically (built-in formats never learn).
 - **Not sandboxed.** See *Execution model & safety* above.
 
 See also: **[Scripting](scripting.md)** for derived-field scripts and live transforms that

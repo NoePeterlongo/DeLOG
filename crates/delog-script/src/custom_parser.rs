@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int64Array, MutableArrayData, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    new_null_array,
 };
 use arrow::datatypes::DataType;
 use delog_core::diagnostics::Diag;
@@ -59,6 +60,10 @@ pub struct ParserOutput {
 
 /// All fallible schema and shape work happens before `open_source`, so an error
 /// cannot leave a partially opened source behind.
+///
+/// Fields whose length differs from their topic clock are not rejected: the
+/// clock defines the row count, shorter fields gain null tail rows, longer
+/// fields drop their extra values, and every fit emits a warning.
 pub fn emit_parser_output(
     sink: &mut dyn IngestSink,
     source_label: &str,
@@ -66,6 +71,7 @@ pub fn emit_parser_output(
 ) -> Result<ParseSummary, String> {
     let mut topic_names = std::collections::HashSet::with_capacity(output.topics.len());
     let mut prepared = Vec::with_capacity(output.topics.len());
+    let mut fit_warnings = Vec::new();
     let mut row_count = 0_u64;
     let mut time_range: Option<TimeRange> = None;
 
@@ -74,29 +80,30 @@ pub fn emit_parser_output(
             return Err(format!("duplicate parser topic '{}'", topic.name));
         }
         let rows = topic.timestamps.len();
-        let fields = topic
-            .fields
-            .iter()
-            .map(|field| {
-                if field.values.len() != rows {
-                    return Err(format!(
-                        "field '{}.{}' has {} values but topic clock has {rows}",
-                        topic.name,
-                        field.name,
-                        field.values.len()
-                    ));
-                }
+        let mut schemas = Vec::with_capacity(topic.fields.len());
+        let mut columns = Vec::with_capacity(topic.fields.len());
+        for field in topic.fields {
+            if field.values.len() != rows {
+                fit_warnings.push(fit_warning(
+                    &format!("{}.{}", topic.name, field.name),
+                    field.values.len(),
+                    rows,
+                ));
+            }
+            let values = fit_to_clock(&field.values, rows);
+            schemas.push(
                 FieldSchema::new(
                     field.name.clone(),
-                    field.values.data_type().clone(),
+                    values.data_type().clone(),
                     field.unit.clone(),
                     1.0,
                 )
-                .map_err(|error| format!("topic '{}': {error}", topic.name))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                .map_err(|error| format!("topic '{}': {error}", topic.name))?,
+            );
+            columns.push(values);
+        }
         let schema = Arc::new(
-            TopicSchema::new(topic.name.clone(), fields)
+            TopicSchema::new(topic.name.clone(), schemas)
                 .map_err(|error| format!("topic '{}': {error}", topic.name))?,
         );
         row_count = row_count
@@ -107,12 +114,11 @@ pub fn emit_parser_output(
                 .ok_or_else(|| format!("topic '{}' timestamps are not ordered", topic.name))?;
             time_range = Some(time_range.map_or(range, |current| current.union(range)));
         }
-        let columns = topic.fields.into_iter().map(|field| field.values).collect();
         prepared.push((schema, topic.timestamps, columns));
     }
 
     let topic_count = prepared.len() as u64;
-    let diagnostics = output.warnings.len() as u64;
+    let diagnostics = (output.warnings.len() + fit_warnings.len()) as u64;
     let summary = ParseSummary {
         topic_count,
         row_count,
@@ -127,8 +133,42 @@ pub fn emit_parser_output(
     for warning in output.warnings {
         sink.diagnostic(Diag::warning("python-parser-duplicate", warning).with_source(source));
     }
+    for warning in fit_warnings {
+        sink.diagnostic(Diag::warning("python-parser-fit", warning).with_source(source));
+    }
     sink.close_source(source, summary.clone());
     Ok(summary)
+}
+
+/// The warning text for a field fitted to its topic clock: the clock defines
+/// the row count, so a short field gains null tail rows and a long field
+/// drops its extra values.
+fn fit_warning(full_name: &str, values: usize, rows: usize) -> String {
+    let action = if values < rows {
+        format!("padded its tail with {} null(s)", rows - values)
+    } else {
+        format!("dropped its {} extra value(s)", values - rows)
+    };
+    format!("field '{full_name}' has {values} values but the clock has {rows}; {action}")
+}
+
+/// Fit `values` to `rows` rows: unchanged when equal, truncated when longer,
+/// padded with nulls when shorter.
+fn fit_to_clock(values: &ArrayRef, rows: usize) -> ArrayRef {
+    use std::cmp::Ordering;
+    match values.len().cmp(&rows) {
+        Ordering::Equal => Arc::clone(values),
+        Ordering::Greater => values.slice(0, rows),
+        Ordering::Less => {
+            let padding = new_null_array(values.data_type(), rows - values.len());
+            let values_data = values.to_data();
+            let padding_data = padding.to_data();
+            let mut fitted = MutableArrayData::new(vec![&values_data, &padding_data], true, rows);
+            fitted.extend(0, 0, values.len());
+            fitted.extend(1, 0, rows - values.len());
+            arrow::array::make_array(fitted.freeze())
+        }
+    }
 }
 
 struct PendingTopic {
@@ -271,21 +311,20 @@ fn clock_range_error(field: &PendingField, index: usize) -> PyErr {
     ))
 }
 
-fn float_clock_micros(field: &PendingField, index: usize, seconds: f64) -> PyResult<i64> {
+/// `None` when the value is non-finite: the row has no valid timestamp and
+/// `clock_fit` drops it instead of rejecting the file.
+fn float_clock_micros(field: &PendingField, index: usize, seconds: f64) -> PyResult<Option<i64>> {
     if !seconds.is_finite() {
-        return Err(value_error(format!(
-            "clock field '{}' value at index {index} must be finite",
-            field.full_name
-        )));
+        return Ok(None);
     }
     let micros = (seconds * 1_000_000.0).round();
     if !micros.is_finite() || !(-(2_f64.powi(63))..2_f64.powi(63)).contains(&micros) {
         return Err(clock_range_error(field, index));
     }
-    Ok(micros as i64)
+    Ok(Some(micros as i64))
 }
 
-fn clock_micros(field: &PendingField, index: usize) -> PyResult<i64> {
+fn clock_micros(field: &PendingField, index: usize) -> PyResult<Option<i64>> {
     macro_rules! signed {
         ($array:ty) => {{
             let seconds = field
@@ -296,6 +335,7 @@ fn clock_micros(field: &PendingField, index: usize) -> PyResult<i64> {
                 .value(index) as i64;
             seconds
                 .checked_mul(1_000_000)
+                .map(Some)
                 .ok_or_else(|| clock_range_error(field, index))
         }};
     }
@@ -310,6 +350,7 @@ fn clock_micros(field: &PendingField, index: usize) -> PyResult<i64> {
             seconds
                 .checked_mul(1_000_000)
                 .and_then(|micros| i64::try_from(micros).ok())
+                .map(Some)
                 .ok_or_else(|| clock_range_error(field, index))
         }};
     }
@@ -352,19 +393,79 @@ fn clock_micros(field: &PendingField, index: usize) -> PyResult<i64> {
     }
 }
 
-fn clock_timestamps(field: &PendingField) -> PyResult<Int64Array> {
-    let mut timestamps = Vec::with_capacity(field.values.len());
-    for index in 0..field.values.len() {
-        let micros = clock_micros(field, index)?;
-        if timestamps.last().is_some_and(|previous| *previous > micros) {
-            return Err(value_error(format!(
-                "clock field '{}' must be non-decreasing (index {index})",
-                field.full_name
-            )));
+/// The clock after fitting: kept timestamps plus the contiguous row ranges
+/// they came from, so every field of the topic keeps exactly those rows.
+struct ClockFit {
+    timestamps: Int64Array,
+    kept_ranges: Vec<(usize, usize)>,
+    dropped: usize,
+    first_dropped: usize,
+}
+
+/// Build the topic clock, skipping rows whose clock value is non-finite
+/// (NaN/inf) instead of rejecting the file: a row without a valid timestamp
+/// cannot be plotted. Decreasing kept values and out-of-range integers stay
+/// hard errors. Returns `None` when every value was non-finite, in which
+/// case the caller drops the whole topic.
+fn clock_fit(field: &PendingField) -> PyResult<Option<ClockFit>> {
+    let total = field.values.len();
+    let mut timestamps = Vec::with_capacity(total);
+    let mut kept_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut dropped = 0_usize;
+    let mut first_dropped = 0_usize;
+    for index in 0..total {
+        match clock_micros(field, index)? {
+            Some(micros) => {
+                if timestamps.last().is_some_and(|previous| *previous > micros) {
+                    return Err(value_error(format!(
+                        "clock field '{}' must be non-decreasing (index {index})",
+                        field.full_name
+                    )));
+                }
+                timestamps.push(micros);
+                match kept_ranges.last_mut() {
+                    Some((_, end)) if *end == index => *end = index + 1,
+                    _ => kept_ranges.push((index, index + 1)),
+                }
+            }
+            None => {
+                if dropped == 0 {
+                    first_dropped = index;
+                }
+                dropped += 1;
+            }
         }
-        timestamps.push(micros);
     }
-    Ok(Int64Array::from(timestamps))
+    if timestamps.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ClockFit {
+        timestamps: Int64Array::from(timestamps),
+        kept_ranges,
+        dropped,
+        first_dropped,
+    }))
+}
+
+/// Keep only `ranges` (half-open `(start, end)` row intervals) of `values`,
+/// preserving order; the clock dropped the rows outside them. Ranges are
+/// clamped to each field's own length: a field that was already shorter
+/// keeps its short tail and the caller's fit-to-clock handles the rest.
+fn take_ranges(values: &ArrayRef, ranges: &[(usize, usize)]) -> ArrayRef {
+    let len = values.len();
+    let total: usize = ranges
+        .iter()
+        .map(|&(start, end)| end.min(len).saturating_sub(start))
+        .sum();
+    let data = values.to_data();
+    let mut taken = MutableArrayData::new(vec![&data], false, total);
+    for &(start, end) in ranges {
+        let end = end.min(len);
+        if start < end {
+            taken.extend(0, start, end);
+        }
+    }
+    arrow::array::make_array(taken.freeze())
 }
 
 pub fn parse_python_result(py: Python<'_>, result: &Bound<'_, PyAny>) -> PyResult<ParserOutput> {
@@ -496,20 +597,36 @@ pub fn parse_python_result(py: Python<'_>, result: &Bound<'_, PyAny>) -> PyResul
                     "topic '{topic_name}' is missing clock field '{topic_name}.rtc' or '{topic_name}.index'"
                 ))
             })?;
-        let timestamps = clock_timestamps(clock)?;
-        let expected = timestamps.len();
-        for (_, field) in &deduped {
+        let Some(fit) = clock_fit(clock)? else {
+            warnings.push(format!(
+                "clock field '{}' has no finite value; topic '{topic_name}' has no timestamps and was dropped",
+                clock.full_name
+            ));
+            continue;
+        };
+        if fit.dropped > 0 {
+            warnings.push(format!(
+                "clock field '{}' has {} non-finite value(s); dropped those rows (first at index {})",
+                clock.full_name, fit.dropped, fit.first_dropped
+            ));
+            // Every field keeps the clock's rows: the dropped rows have no
+            // timestamp, so their values are not addressable.
+            for (_, field) in deduped.iter_mut() {
+                field.values = take_ranges(&field.values, &fit.kept_ranges);
+            }
+        }
+        let expected = fit.timestamps.len();
+        for (_, field) in deduped.iter_mut() {
             if field.values.len() != expected {
-                return Err(value_error(format!(
-                    "field '{}' has {} values but topic '{topic_name}' clock has {expected}",
-                    field.full_name,
-                    field.values.len(),
-                )));
+                // The clock defines the row count; a field that disagrees is
+                // fitted (null-padded or truncated) instead of rejected.
+                warnings.push(fit_warning(&field.full_name, field.values.len(), expected));
+                field.values = fit_to_clock(&field.values, expected);
             }
         }
         output_topics.push(ParserTopic {
             name: topic_name,
-            timestamps,
+            timestamps: fit.timestamps,
             fields: deduped
                 .into_iter()
                 .map(|(name, field)| ParserField {
@@ -943,12 +1060,84 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_clock_and_unequal_lengths_with_field_names() {
+    fn missing_clock_is_rejected_and_unequal_lengths_fit_with_warnings() {
         assert!(
             error("[('t.v',[1],'')]").contains("t") && error("[('t.v',[1],'')]").contains("clock")
         );
-        let message = error("[('t.index',[0,1],''),('t.v',[1],'')]");
-        assert!(message.contains("t.v") && message.contains('1') && message.contains('2'));
+
+        // The clock defines the row count: a short field is null-padded, a
+        // long field is truncated, and both raise a warning.
+        let output = parse("[('t.index',[0,1],''),('t.v',[1],''),('t.w',[1,2,3],'')]").unwrap();
+        assert_eq!(output.warnings.len(), 2);
+        assert!(
+            output.warnings[0].contains("t.v") && output.warnings[0].contains("null"),
+            "{}",
+            output.warnings[0]
+        );
+        assert!(
+            output.warnings[1].contains("t.w") && output.warnings[1].contains("dropped"),
+            "{}",
+            output.warnings[1]
+        );
+        let fields: HashMap<&str, &ArrayRef> = output.topics[0]
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), &field.values))
+            .collect();
+        let short = fields["v"].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(short.len(), 2);
+        assert_eq!(short.value(0), 1);
+        assert!(short.is_null(1), "the missing row is a null");
+        let long = fields["w"].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(long.len(), 2);
+        assert_eq!((long.value(0), long.value(1)), (1, 2));
+    }
+
+    #[test]
+    fn emit_fits_mismatched_field_lengths_with_nulls_and_diagnostics() {
+        let output = ParserOutput {
+            topics: vec![ParserTopic {
+                name: "t".to_owned(),
+                timestamps: Int64Array::from(vec![0, 1, 2]),
+                fields: vec![
+                    ParserField {
+                        name: "short".to_owned(),
+                        unit: None,
+                        values: Arc::new(Int64Array::from(vec![7])),
+                    },
+                    ParserField {
+                        name: "long".to_owned(),
+                        unit: None,
+                        values: Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                    },
+                ],
+            }],
+            warnings: Vec::new(),
+            arrow_bytes: 0,
+        };
+        let mut sink = CollectSink::default();
+
+        let summary = emit_parser_output(&mut sink, "flight", output).unwrap();
+
+        assert_eq!(sink.batches.len(), 1);
+        assert_eq!(summary.diagnostics, 2);
+        assert_eq!(sink.batches[0].columns.len(), 2);
+        let short = sink.batches[0].columns[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(short.len(), 3);
+        assert_eq!(short.value(0), 7);
+        assert!(short.is_null(1) && short.is_null(2));
+        let long = sink.batches[0].columns[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(long.len(), 3);
+        assert_eq!((long.value(0), long.value(1), long.value(2)), (1, 2, 3));
+        let fit_codes: Vec<&str> = sink.diagnostics.iter().map(|diag| diag.code).collect();
+        assert_eq!(fit_codes, ["python-parser-fit", "python-parser-fit"]);
+        assert_eq!(sink.closed[0].1.diagnostics, 2);
     }
 
     #[test]
@@ -983,20 +1172,90 @@ mod tests {
     }
 
     #[test]
-    fn rejects_boolean_nonfinite_overflow_and_decreasing_clocks() {
+    fn rejects_boolean_overflow_and_decreasing_clocks() {
         assert!(error("[('t.index',[False,True],''),('t.v',[1,2],'')]").contains("t.index"));
         let preferred_rtc =
             error("[('t.index',[0,1],''),('t.rtc',[False,True],''),('t.v',[1,2],'')]");
         assert!(preferred_rtc.contains("t.rtc") && preferred_rtc.contains("Boolean"));
-        for value in ["float('nan')", "float('inf')", "-float('inf')"] {
-            let source = format!("[('t.index',[0,{value}],''),('t.v',[1,2],'')]");
-            let message = error(&source);
-            assert!(message.contains("t.index") && message.contains("finite"));
-        }
         let overflow = error("[('t.index',[1e30],'')]");
         assert!(overflow.contains("t.index") && overflow.contains("range"));
         let decreasing = error("[('t.index',[2.,1.],'')]");
         assert!(decreasing.contains("t.index") && decreasing.contains("non-decreasing"));
+    }
+
+    #[test]
+    fn non_finite_clock_rows_are_dropped_from_the_whole_topic() {
+        let output = parse(
+            "[('t.index',[0.,1.,float('nan'),3.,float('inf')],''),('t.v',[10,20,30,40,50],'')]",
+        )
+        .unwrap();
+
+        assert_eq!(output.warnings.len(), 1);
+        assert!(
+            output.warnings[0].contains("t.index") && output.warnings[0].contains('2'),
+            "{}",
+            output.warnings[0]
+        );
+        let topic = &output.topics[0];
+        assert_eq!(topic.timestamps.len(), 3);
+        assert_eq!(topic.timestamps.value(0), 0);
+        assert_eq!(topic.timestamps.value(1), 1_000_000);
+        assert_eq!(topic.timestamps.value(2), 3_000_000);
+        // The kept rows of every field follow the clock: rows 2 and 4 are
+        // gone, not null-padded.
+        let v = topic.fields[1]
+            .values
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!((v.value(0), v.value(1), v.value(2)), (10, 20, 40));
+    }
+
+    #[test]
+    fn a_topic_whose_clock_has_no_finite_value_is_dropped_with_a_warning() {
+        let output = parse(
+            "[('bad.index',[float('nan'),float('inf')],''),('bad.v',[1,2],''),('good.index',[0.,1.],''),('good.v',[3.,4.],'')]",
+        )
+        .unwrap();
+
+        assert_eq!(output.topics.len(), 1);
+        assert_eq!(output.topics[0].name, "good");
+        assert_eq!(output.warnings.len(), 1);
+        assert!(
+            output.warnings[0].contains("bad.index") && output.warnings[0].contains("dropped"),
+            "{}",
+            output.warnings[0]
+        );
+    }
+
+    #[test]
+    fn non_finite_clock_rows_compose_with_short_fields() {
+        // Clock rows 0..4 with row 2 non-finite; `short` has one value.
+        let output = parse(
+            "[('t.index',[0.,1.,float('nan'),3.],''),('t.v',[1.,2.,9.,4.,5.],''),('t.short',[7.],'')]",
+        )
+        .unwrap();
+
+        // The fit-to-clock warning for the short field; the drop warning.
+        assert_eq!(output.warnings.len(), 2);
+        let topic = &output.topics[0];
+        assert_eq!(topic.timestamps.len(), 3);
+        let short = topic.fields[2]
+            .values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(
+            short.len(),
+            3,
+            "the short field follows the kept clock rows"
+        );
+        assert_eq!(short.value(0), 7.);
+        assert!(
+            short.is_null(1) && short.is_null(2),
+            "the missing tail is null"
+        );
     }
 
     #[test]
