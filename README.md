@@ -66,6 +66,7 @@ cargo build --release --locked -p delog-app --no-default-features
 - [Scripting](docs/scripting.md) - embedded-Python derived fields, the `delog` API, live transforms.
 - [Python app control](docs/app_control.md) - plots, annotations, vehicles, markers, layouts, and atomic batches.
 - [Custom parsers](docs/custom_parsers.md) - Python file parsers via `Parse(raw_data)`.
+- [Desktop integration](docs/desktop_integration.md) - opening logs from the command line and the file manager on Linux.
 
 ## License
 

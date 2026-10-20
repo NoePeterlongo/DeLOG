@@ -2,7 +2,8 @@
 Type=Application
 Name=DeLOG
 Comment=Drone flight log & live telemetry analyzer
-Exec=delog
+Exec=delog %F
 Icon=delog
 Categories=Utility;Science;
+MimeType=application/x-ulg;application/x-ardupilot-bin;application/x-mavlink-tlog;
 Terminal=false

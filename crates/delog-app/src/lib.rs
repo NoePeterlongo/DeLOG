@@ -15,6 +15,15 @@ pub(crate) mod update;
 
 pub use shell::app::DelogApp;
 
+/// Positional command-line arguments to open at startup: paths that are not
+/// `--flags`. A single `-` is a path (stdin is not a log source); flags like
+/// `--check-scripting` are handled before this runs.
+pub fn cli_file_paths(args: impl Iterator<Item = String>) -> Vec<std::path::PathBuf> {
+    args.filter(|arg| !arg.starts_with("--"))
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
 pub fn run() -> eframe::Result {
     #[cfg(feature = "bundled-python")]
     scripting::py_runtime::init_bundled_python();
@@ -34,13 +43,14 @@ pub fn run() -> eframe::Result {
     init_tracing();
 
     let options = app_native_options();
+    let cli_paths = cli_file_paths(std::env::args().skip(1));
 
     eframe::run_native(
         "DeLOG",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(DelogApp::new(cc)))
+            Ok(Box::new(DelogApp::new(cc, cli_paths)))
         }),
     )
 }
@@ -239,5 +249,36 @@ mod native_options_tests {
                 other => panic!("unexpected memory hints {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_args_tests {
+    use super::cli_file_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cli_paths_skip_flags_and_keep_order() {
+        let args = [
+            "--check-scripting".to_owned(),
+            "--some-flag=value".to_owned(),
+            "/logs/flight.ulg".to_owned(),
+            "-".to_owned(),
+            "raw.BIN".to_owned(),
+        ];
+        assert_eq!(
+            cli_file_paths(args.into_iter()),
+            vec![
+                PathBuf::from("/logs/flight.ulg"),
+                PathBuf::from("-"),
+                PathBuf::from("raw.BIN"),
+            ],
+            "flags are skipped, a single dash stays a path, order is kept"
+        );
+    }
+
+    #[test]
+    fn cli_paths_accept_an_empty_command_line() {
+        assert!(cli_file_paths(std::iter::empty()).is_empty());
     }
 }

@@ -579,7 +579,7 @@ pub struct DelogApp {
 }
 
 impl DelogApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, cli_paths: Vec<std::path::PathBuf>) -> Self {
         let settings = crate::config::layout::doc::load_app_settings();
         settings.theme.apply(&cc.egui_ctx);
         settings.font.apply(&cc.egui_ctx);
@@ -609,6 +609,15 @@ impl DelogApp {
                 None => (None, Some("cache directory unavailable".to_owned())),
             };
         let (picked_files_tx, picked_files) = mpsc::channel();
+        // Files given on the command line open through the same flow as the
+        // File > Open picker - learned extension-to-parser routing included -
+        // on the first update.
+        if !cli_paths.is_empty() {
+            let _ = picked_files_tx.send(PickedFiles {
+                paths: cli_paths,
+                parser: None,
+            });
+        }
         let (traj_results_tx, traj_results) = mpsc::channel();
         let (imported_layouts_tx, imported_layouts) = mpsc::channel();
         let (exported_layouts_tx, exported_layouts) = mpsc::channel();
