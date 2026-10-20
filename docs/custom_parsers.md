@@ -34,7 +34,9 @@ the same kind of global library as saved [scripts](scripting.md#the-script-libra
 
 The file **stem** is the parser name shown in the menu. Files are editable with any external
 editor; new or changed files appear without restarting (the list is read fresh each time the
-menu opens).
+menu opens). A **symlink** into the directory works too: link `my_parser.py` to a parser kept
+elsewhere (a repo, a shared folder) and it is listed and loaded through the link; broken
+links are ignored.
 
 Custom parsers are **never content-sniffed**. DéLOG only auto-detects the built-in Rust
 formats; a custom Python parser is always chosen explicitly the first time, and the Parsers
