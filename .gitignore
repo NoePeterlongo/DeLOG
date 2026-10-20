@@ -13,3 +13,10 @@ docs/superpowers/
 
 __pycache__/
 *.pyc
+
+# AppImage packaging (scripts/dev/appimage.sh): bundled runtime staging,
+# downloaded tool, and produced artifacts.
+staging/
+DeLOG.AppDir/
+appimagetool
+*.AppImage

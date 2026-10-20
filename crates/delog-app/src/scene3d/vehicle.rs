@@ -15,6 +15,10 @@ use glam::{Mat3, Mat4, Quat, Vec3};
 use crate::scene3d::geo;
 use crate::scene3d::reference::{first_valid_fix_by_time, first_valid_gps_fix};
 
+mod rebind;
+
+pub use rebind::rebind_to_recreated_source;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ModelKind {
     None,

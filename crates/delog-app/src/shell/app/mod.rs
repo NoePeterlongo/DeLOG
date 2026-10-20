@@ -579,7 +579,7 @@ pub struct DelogApp {
 }
 
 impl DelogApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, cli_paths: Vec<std::path::PathBuf>) -> Self {
         let settings = crate::config::layout::doc::load_app_settings();
         settings.theme.apply(&cc.egui_ctx);
         settings.font.apply(&cc.egui_ctx);
@@ -609,6 +609,15 @@ impl DelogApp {
                 None => (None, Some("cache directory unavailable".to_owned())),
             };
         let (picked_files_tx, picked_files) = mpsc::channel();
+        // Files given on the command line open through the same flow as the
+        // File > Open picker - learned extension-to-parser routing included -
+        // on the first update.
+        if !cli_paths.is_empty() {
+            let _ = picked_files_tx.send(PickedFiles {
+                paths: cli_paths,
+                parser: None,
+            });
+        }
         let (traj_results_tx, traj_results) = mpsc::channel();
         let (imported_layouts_tx, imported_layouts) = mpsc::channel();
         let (exported_layouts_tx, exported_layouts) = mpsc::channel();
@@ -806,6 +815,15 @@ impl DelogApp {
         let tx = self.picked_files_tx.clone();
         let ctx = ctx.clone();
         let parser = parser.map(str::to_owned);
+        // Learned custom-parser extensions join the built-in filter so the
+        // picker proposes exotic logs directly.
+        let learned_extensions: Vec<String> = self
+            .settings
+            .parser_files
+            .parser_by_extension
+            .keys()
+            .cloned()
+            .collect();
         std::thread::Builder::new()
             .name("delog-open-dialog".into())
             .spawn(move || {
@@ -813,13 +831,22 @@ impl DelogApp {
                     Some(name) => rfd::FileDialog::new()
                         .add_filter("All files", &["*"])
                         .set_title(format!("Open with {}", parser_label(name))),
-                    None => rfd::FileDialog::new()
-                        .add_filter(
-                            "Flight logs",
-                            &["bin", "BIN", "ulg", "ulog", "tlog", "parquet"],
-                        )
-                        .add_filter("All files", &["*"])
-                        .set_title("Open flight logs"),
+                    None => {
+                        let mut extensions = vec![
+                            "bin".to_owned(),
+                            "BIN".to_owned(),
+                            "ulg".to_owned(),
+                            "ulog".to_owned(),
+                            "tlog".to_owned(),
+                            "parquet".to_owned(),
+                        ];
+                        extensions.extend(learned_extensions);
+                        let extensions: Vec<&str> = extensions.iter().map(String::as_str).collect();
+                        rfd::FileDialog::new()
+                            .add_filter("Flight logs", &extensions)
+                            .add_filter("All files", &["*"])
+                            .set_title("Open flight logs")
+                    }
                 };
                 if let Some(paths) = dialog.pick_files() {
                     let _ = tx.send(PickedFiles { paths, parser });
@@ -829,10 +856,77 @@ impl DelogApp {
             .expect("spawn file dialog thread");
     }
 
+    /// Learn the extension-to-parser routing from successful custom-parser
+    /// reads: opening a `.foo` file with a parser makes the plain Open flow
+    /// use that parser for every later `.foo` pick. Built-in sniffed
+    /// extensions never learn; the last parser used for an extension wins.
+    #[cfg(feature = "scripting")]
+    fn learn_parser_file_extensions(&mut self) {
+        for (parser_name, path) in self.scripts.take_parsed_parser_files() {
+            let Some(extension) =
+                crate::config::settings::ParserFileSettings::learnable_extension(&path)
+            else {
+                continue;
+            };
+            if self
+                .settings
+                .parser_files
+                .parser_by_extension
+                .get(&extension)
+                .is_some_and(|current| current == &parser_name)
+            {
+                continue;
+            }
+            self.settings
+                .parser_files
+                .parser_by_extension
+                .insert(extension.clone(), parser_name.clone());
+            match crate::config::layout::doc::save_app_settings(&self.settings) {
+                Ok(()) => self
+                    .session
+                    .push_diagnostic(delog_core::diagnostics::Diag::info(
+                        "parser-bind",
+                        format!("files with .{extension} now open with {parser_name}"),
+                    )),
+                Err(error) => self
+                    .session
+                    .push_diagnostic(delog_core::diagnostics::Diag::error(
+                        "settings-save",
+                        error.to_string(),
+                    )),
+            }
+        }
+    }
+
     fn handle_picked_files(&mut self) {
         while let Ok(picked) = self.picked_files.try_recv() {
             for path in picked.paths {
-                self.session.open_path(path, picked.parser.clone());
+                match picked.parser.clone() {
+                    // An explicit picker choice (built-in parsers) goes
+                    // through the native parse path.
+                    Some(parser) => self.session.open_path(path, Some(parser)),
+                    None => {
+                        // A learned custom parser runs through the scripting
+                        // engine, exactly like Parsers > Parse File; a custom
+                        // parser name is unknown to the native registry.
+                        #[cfg(feature = "scripting")]
+                        if let Some(parser) = self.settings.parser_files.parser_for(&path) {
+                            if self.scripts.parse_with(&parser, path.clone()) {
+                                continue;
+                            }
+                            self.session.push_diagnostic(
+                                delog_core::diagnostics::Diag::error(
+                                    "parser-bind",
+                                    format!(
+                                        "{}: learned parser '{parser}' is unavailable, falling back to format sniffing",
+                                        path.display(),
+                                    ),
+                                ),
+                            );
+                        }
+                        self.session.open_path(path, None);
+                    }
+                }
             }
         }
     }
@@ -2209,6 +2303,7 @@ impl DelogApp {
                 CommandId::DisconnectLive => {
                     self.session.stop_all_live();
                 }
+                CommandId::ResetLiveSession => self.reset_live_session(snapshot),
                 CommandId::CancelTasks => {
                     self.cancel_sequences();
                     self.session.cancel_all();
@@ -2512,6 +2607,49 @@ impl DelogApp {
         self.traj_dirty = true;
         for diag in layout.diagnostics {
             self.session.push_diagnostic(diag);
+        }
+    }
+
+    /// Live-session reset: drop every live and live-derived source, then
+    /// respawn the links so the next flight restarts at t=0. Layouts,
+    /// plots, and vehicle profiles keep their configuration and re-resolve
+    /// when telemetry returns; marker and annotation time values are kept
+    /// as part of the layout.
+    fn reset_live_session(&mut self, snapshot: &delog_core::snapshot::StoreSnapshot) {
+        // Pin the configured plots to their topic/field names before the
+        // sources vanish, so they re-resolve when the respawned links
+        // re-ingest the same messages.
+        self.workspace.ghost_live_traces(snapshot);
+        #[cfg(feature = "scripting")]
+        self.scripts.reset_live_transforms();
+        let sender = self.session.ingest_sender();
+        for source in self.dataflow.reset_live_publications(&sender) {
+            self.session.remove_source(source);
+        }
+        for flow in self.headless_flows.values_mut() {
+            let _ = flow.controller.stop_owned(&sender);
+            flow.controller.reset_live(&sender);
+        }
+        let links: Vec<_> = self
+            .session
+            .live_statuses()
+            .into_iter()
+            .map(|status| (status.endpoint, status.recording))
+            .collect();
+        self.session.stop_all_live();
+        for source in live_source_ids(snapshot) {
+            self.session.remove_source(source);
+        }
+        for (endpoint, recording) in links {
+            // A respawned link records into a fresh timestamped file so the
+            // previous flight's recording is never overwritten.
+            let recording = recording
+                .as_deref()
+                .map(ConnectionDialog::next_recording_path);
+            if let Err(err) = self.session.start_live(endpoint, recording) {
+                self.session
+                    .push_diagnostic(delog_core::diagnostics::Diag::error("live-open", err));
+            }
         }
     }
 
@@ -3158,6 +3296,18 @@ impl eframe::App for DelogApp {
             }
             for field in pruned {
                 self.caches.unpin(field);
+            }
+            // Vehicles hold dense source/field ids: after a live-session
+            // reset they rebind onto the recreated same-label source.
+            let mut rebound = 0;
+            for vehicle in &mut self.vehicles {
+                if crate::scene3d::vehicle::rebind_to_recreated_source(vehicle, &snapshot) {
+                    rebound += 1;
+                }
+            }
+            if rebound > 0 {
+                self.vehicle_revision = self.vehicle_revision.wrapping_add(1);
+                self.traj_dirty = true;
             }
             if resolved > 0 {
                 self.session
@@ -3818,6 +3968,7 @@ impl eframe::App for DelogApp {
                 self.settings.scripting.auto_open_console,
                 self.settings.scripting.use_original_timestamps,
             );
+            self.learn_parser_file_extensions();
             let vehicle_profiles =
                 crate::session::vehicle_profiles::VehicleProfileLibrary::from_config_dir();
             let mut layout_effects = control_service::LayoutControlEffects::default();
@@ -5226,6 +5377,24 @@ fn open_source_ids(
         .sources
         .iter()
         .filter(|source| !source.entry.removed)
+        .map(|source| source.entry.id)
+        .collect()
+}
+
+fn live_source_ids(
+    snapshot: &delog_core::snapshot::StoreSnapshot,
+) -> Vec<delog_core::identity::SourceId> {
+    use delog_core::identity::SourceKind;
+    snapshot
+        .sources
+        .iter()
+        .filter(|source| {
+            !source.entry.removed
+                && matches!(
+                    source.entry.kind,
+                    SourceKind::Live | SourceKind::LiveDerived
+                )
+        })
         .map(|source| source.entry.id)
         .collect()
 }

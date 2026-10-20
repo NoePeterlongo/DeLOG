@@ -126,6 +126,66 @@ fn prune_removed_fields_drops_traces_for_removed_sources() {
 }
 
 #[test]
+fn ghost_live_traces_convert_live_sources_into_resolvable_ghosts() {
+    use delog_core::identity::SourceKind;
+
+    let mut identity = delog_core::identity::IdentityRegistry::new();
+    let source = identity.add_source_with_kind("mavlink:udp:14550:sysid1", SourceKind::Live);
+    let topic = identity.add_topic(source, "LOCAL_POSITION_NED").unwrap();
+    let field = identity.add_field(topic, "x").unwrap();
+    let snapshot = StoreSnapshot::from_registry(&identity, [], 1).unwrap();
+
+    let mut workspace = Workspace::new();
+    assert!(workspace.add_trace_to_first_plot(field));
+    workspace.ghost_live_traces(&snapshot);
+
+    // The live trace became a ghost pinned to the source label.
+    assert!(workspace.fields().next().is_none());
+    let pane = workspace.plot_panes().next().unwrap();
+    let ghost = pane.ghosts.first().expect("live trace becomes a ghost");
+    assert_eq!(ghost.source.as_deref(), Some("mavlink:udp:14550:sysid1"));
+    assert_eq!(ghost.topic, "LOCAL_POSITION_NED");
+    assert_eq!(ghost.field, "x");
+
+    // The ghost resolves back once a same-named source re-ingests the field.
+    // The old source is tombstoned first, mirroring the reset flow.
+    identity.remove_source(source);
+    let reborn = identity.add_source_with_kind("mavlink:udp:14550:sysid1", SourceKind::Live);
+    let reborn_topic = identity.add_topic(reborn, "LOCAL_POSITION_NED").unwrap();
+    let reborn_field = identity.add_field(reborn_topic, "x").unwrap();
+    let next = StoreSnapshot::from_registry(&identity, [], 2).unwrap();
+    assert_eq!(workspace.resolve_ghosts(&next), 1);
+    assert_eq!(workspace.fields().collect::<Vec<_>>(), vec![reborn_field]);
+}
+
+#[test]
+fn ghost_live_traces_leave_offline_and_script_sources_to_their_paths() {
+    use delog_core::identity::SourceKind;
+
+    let mut identity = delog_core::identity::IdentityRegistry::new();
+    let file_source = identity.add_source("flight");
+    let file_topic = identity.add_topic(file_source, "POS").unwrap();
+    let file_field = identity.add_field(file_topic, "Alt").unwrap();
+    let script_source = identity.add_source_with_kind("script:calc", SourceKind::LiveDerived);
+    let script_topic = identity.add_topic(script_source, "derived").unwrap();
+    let script_field = identity.add_field(script_topic, "alt").unwrap();
+    let snapshot = StoreSnapshot::from_registry(&identity, [], 1).unwrap();
+
+    let mut workspace = Workspace::new();
+    assert!(workspace.add_trace_to_first_plot(file_field));
+    assert!(workspace.add_trace_to_first_plot(script_field));
+
+    workspace.ghost_live_traces(&snapshot);
+
+    // File traces stay as-is; script traces are ghosted later by the prune
+    // path when their source is actually removed.
+    let fields = workspace.fields().collect::<Vec<_>>();
+    assert_eq!(fields.len(), 2);
+    assert!(fields.contains(&file_field));
+    assert!(fields.contains(&script_field));
+}
+
+#[test]
 fn prune_removed_fields_rebinds_script_traces_to_recreated_fields() {
     let mut identity = delog_core::identity::IdentityRegistry::new();
     let old_source = identity.add_source("script:calc");

@@ -34,11 +34,21 @@ the same kind of global library as saved [scripts](scripting.md#the-script-libra
 
 The file **stem** is the parser name shown in the menu. Files are editable with any external
 editor; new or changed files appear without restarting (the list is read fresh each time the
-menu opens).
+menu opens). A **symlink** into the directory works too: link `my_parser.py` to a parser kept
+elsewhere (a repo, a shared folder) and it is listed and loaded through the link; broken
+links are ignored.
 
-Custom parsers are **never auto-sniffed**. DéLOG only auto-detects the built-in Rust formats;
-a custom Python parser is always chosen explicitly, and the Parsers menu lists custom Python
-parsers only (not the built-in parsers).
+Custom parsers are **never content-sniffed**. DéLOG only auto-detects the built-in Rust
+formats; a custom Python parser is always chosen explicitly the first time, and the Parsers
+menu lists custom Python parsers only (not the built-in parsers).
+
+After you open a file with a custom parser once, DéLOG remembers the mapping
+"file extension → parser" in its settings: the plain **File ▸ Open** flow then routes files
+with that extension through that parser automatically, and the Open dialog lists the
+extension in its filter. Extensions of the built-in formats (`.ulg`, `.BIN`, `.tlog`,
+`.parquet`) are never learned - they always keep built-in detection, even after a deliberate
+custom-parser read. The last parser used for an extension wins; delete the
+`parser_files` entry in the settings file to unlearn a mapping.
 
 ---
 
@@ -103,7 +113,9 @@ words = raw_data.view(np.uint16)   # reinterpret the underlying bytes
 - **`field_name`** - a string. The **first dot** splits topic from field: `"gps.main.lat"`
   becomes topic `gps`, field `main.lat`. A name with no dot is its own topic.
 - **`values`** - a one-dimensional NumPy-compatible array (see [dtypes](#supported-dtypes-and-nan)).
-  All fields **within the same topic** must have equal length.
+  The topic's clock defines the row count: a field that disagrees is fitted - shorter fields
+  are null-padded, longer fields are truncated - and each fit records a warning. Exact lengths
+  still produce warning-free output.
 - **`tooltip`** - a string shown when hovering the field in the data browser.
 
 ---
@@ -115,6 +127,9 @@ words = raw_data.view(np.uint16)   # reinterpret the underlying bytes
   field. Both clock fields remain visible in the browser.
 - Clock values are interpreted as **seconds** and rounded to canonical signed `i64`
   **microseconds** (DéLOG's internal time unit).
+- Rows whose clock value is non-finite (NaN/inf) have no timestamp and are **dropped from the
+  whole topic**, with a warning naming the first dropped index; a clock with no finite value
+  drops its topic. Decreasing or out-of-range clocks are errors.
 - Exact duplicate full field names are accepted for legacy compatibility: the **last value
   wins**, and DéLOG records a warning.
 
@@ -188,11 +203,20 @@ This produces an `imu` topic clocked by `imu.rtc`, with fields `ax`, `ay`, `az`.
 - **Input is always `float32` bytes.** You get `numpy.fromfile(..., dtype=float32)` semantics
   and must reinterpret with `.view(...)` for other layouts; a partial trailing `float32` is
   dropped.
-- **Equal length per topic.** Every field in a topic must match its clock's length.
+- **Fields fit the clock.** The clock (`.rtc`/`.index`) defines each topic's row count. A field
+  shorter than its clock is padded with null rows at the end (a visible gap on plots); a longer
+  field drops its extra values. Every fit raises a warning in the Logging dock naming the
+  field - fix the parser when the mismatch is not intentional.
 - **Clocks are seconds.** `.rtc`/`.index` values are read as seconds and converted to µs;
-  scale accordingly.
-- **Not auto-detected.** You always pick a custom parser explicitly from
-  **Parsers ▸ Parse File**.
+  scale accordingly. Rows whose clock value is non-finite (NaN/inf) have no timestamp and are
+  dropped from the whole topic, with a warning naming the first dropped index; a topic whose
+  clock has no finite value at all is dropped. Out-of-range and decreasing clocks stay errors.
+- **Chosen explicitly, then remembered.** Pick a custom parser explicitly the first time
+  (**Parsers ▸ Parse File**); after a successful parse, **File ▸ Open** routes the file's
+  extension through that parser automatically (built-in formats never learn).
+- **Field order is yours.** The data browser keeps the order your `Parse` function returns -
+  topics and fields appear exactly as proposed - while built-in formats are sorted
+  naturally.
 - **Not sandboxed.** See *Execution model & safety* above.
 
 See also: **[Scripting](scripting.md)** for derived-field scripts and live transforms that

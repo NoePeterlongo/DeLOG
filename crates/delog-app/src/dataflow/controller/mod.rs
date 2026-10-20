@@ -756,17 +756,21 @@ impl DataFlowController {
         std::mem::take(&mut self.live_needs_reset)
     }
 
-    pub fn stop(&mut self, sender: &IngestSender) {
+    pub fn stop(&mut self, sender: &IngestSender) -> Option<SourceId> {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
         }
         self.latest_generation.fetch_add(1, Ordering::Relaxed);
         self.pending = None;
-        self.reset_live(sender);
+        self.reset_live(sender)
     }
 
-    pub fn reset_live(&mut self, sender: &IngestSender) {
-        if let Some(source) = self.live_source.take() {
+    /// Stop the live publication and clear its watermark state. Returns the
+    /// closed live-derived source so a caller can drop its data (the close
+    /// alone keeps it).
+    pub fn reset_live(&mut self, sender: &IngestSender) -> Option<SourceId> {
+        let closed = self.live_source.take();
+        if let Some(source) = closed {
             let mut sink = sender.file_sink();
             sink.close_source(source, delog_core::ingest::ParseSummary::default());
         }
@@ -774,6 +778,7 @@ impl DataFlowController {
         self.live_watermark_t = None;
         self.running_preview.clear();
         self.last_previewed_t.clear();
+        closed
     }
 
     fn append_publish(

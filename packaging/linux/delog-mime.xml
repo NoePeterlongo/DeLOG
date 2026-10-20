@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <!-- Registered by packaging/linux/install-association.sh; see
+       docs/desktop_integration.md for the install and the caveats (the
+       *.bin glob is broad). -->
+  <mime-type type="application/x-ulg">
+    <comment>PX4 ULog flight log</comment>
+    <glob pattern="*.ulg"/>
+  </mime-type>
+  <mime-type type="application/x-ardupilot-bin">
+    <comment>ArduPilot dataflash log</comment>
+    <glob pattern="*.bin"/>
+  </mime-type>
+  <mime-type type="application/x-mavlink-tlog">
+    <comment>MAVLink telemetry log</comment>
+    <glob pattern="*.tlog"/>
+  </mime-type>
+</mime-info>

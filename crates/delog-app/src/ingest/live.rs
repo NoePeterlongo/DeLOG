@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -210,6 +210,13 @@ impl ConnectionDialog {
             return Err("recording folder is required".to_owned());
         }
         Ok(Some(PathBuf::from(dir).join(recording_filename(unix_us))))
+    }
+
+    /// A fresh timestamped recording path in the same folder as `previous`,
+    /// for respawning a link without overwriting its earlier recording.
+    pub fn next_recording_path(previous: &Path) -> PathBuf {
+        let dir = previous.parent().unwrap_or_else(|| Path::new(""));
+        dir.join(recording_filename(now_unix_us()))
     }
 
     fn choose_recording_folder(&mut self, ctx: &egui::Context) {

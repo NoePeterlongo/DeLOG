@@ -1,0 +1,31 @@
+# Development environment for DeLOG.
+#
+#   docker compose build
+#   docker compose run --rm dev <command>   # e.g. cargo clippy --workspace
+#   docker compose up -d                   # long-lived shell: docker compose exec dev bash
+#
+# The repo is mounted at /workspace; the pinned toolchain from
+# rust-toolchain.toml is baked into the image. Named volumes persist the
+# cargo registry and the target/ dir across rebuilds.
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/dev.Dockerfile
+    image: delog-dev:latest
+    gpus: all # NVIDIA driver libs + Vulkan ICD injected by nvidia-container-toolkit
+    volumes:
+      - .:/workspace
+      - delog-target:/workspace/target
+      - delog-cargo:/root/.cargo
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NO_AT_BRIDGE=1 # no accessibility bus in the container; silences zenity warnings
+    working_dir: /workspace
+    command: sleep infinity
+
+volumes:
+  delog-target:
+  delog-cargo:
